@@ -11,27 +11,6 @@ if not hasattr(fitz, 'PDF_BTN_TYPE_SUBMIT'):
 if not hasattr(fitz, 'PDF_BTN_TYPE_RESET'):
     fitz.PDF_BTN_TYPE_RESET = 2
 
-def clean_placeholder_text(text):
-    """
-    Clean spaces in placeholder strings to handle Word conversion artifacts.
-    """
-    # First, fix spaced brackets
-    text = re.sub(r'\{\s*\{', '{{', text)
-    text = re.sub(r'\}\s*\}', '}}', text)
-    
-    # Then clean inside placeholders
-    def clean_inside(match):
-        inside = match.group(1)
-        # Remove all whitespace (spaces, newlines, etc.)
-        inside = re.sub(r'\s+', '', inside)
-        # Remove spaces around colons and pipes (though spaces are removed, keep for consistency)
-        inside = re.sub(r'\s*:\s*', ':', inside)
-        inside = re.sub(r'\s*\|\s*', '|', inside)
-        return '{{' + inside + '}}'
-    
-    text = re.sub(r'\{\{(.*?)\}\}', clean_inside, text)
-    return text
-
 def parse_placeholder(placeholder):
     """
     Parse the placeholder string like 'textbox:firstname|required'
@@ -336,8 +315,7 @@ def convert_docx_to_fillable_pdf(pdf_path, output_pdf_path):
             # Get text in a rect around the {{
             text_rect = fitz.Rect(inst.x0, inst.y0, inst.x0 + 300, inst.y0 + 50)  # Adjust size as needed
             text = page.get_textbox(text_rect)
-            text = clean_placeholder_text(text)
-            matches = re.findall(r'\{\{(.*?)\}\}', text, re.DOTALL)
+            matches = re.findall(r'\{\{(.*?)\}\}', text)
             placeholders.update(matches)
         
         placeholders = list(placeholders)
@@ -409,29 +387,16 @@ if __name__ == "__main__":
     import sys
     import os
     if len(sys.argv) != 2:
-        print("Usage: python pdfconv.py <docx_or_pdf_file>")
+        print("Usage: python pdfconv.py <docx_file>")
         sys.exit(1)
-    input_path = sys.argv[1]
-    if not os.path.exists(input_path):
-        print(f"Error: File not found at {input_path}")
+    docx_path = sys.argv[1]
+    if not os.path.exists(docx_path):
+        print(f"Error: DOCX file not found at {docx_path}")
         sys.exit(1)
-    
-    if input_path.lower().endswith('.docx'):
-        # Convert DOCX to PDF
-        pdf_path = os.path.splitext(input_path)[0] + '.pdf'
-        print(f"Converting {input_path} to {pdf_path}")
-        try:
-            convert(input_path, pdf_path)
-        except Exception as e:
-            print(f"Conversion failed: {e}")
-            if not os.path.exists(pdf_path):
-                print("PDF was not created. Exiting.")
-                sys.exit(1)
-            else:
-                print("PDF exists, proceeding with processing.")
-    else:
-        pdf_path = input_path
-    
+    # Convert DOCX to PDF
+    pdf_path = os.path.splitext(docx_path)[0] + '.pdf'
+    print(f"Converting {docx_path} to {pdf_path}")
+    convert(docx_path, pdf_path)
     # Process the PDF
     output_pdf_path = os.path.splitext(pdf_path)[0] + '_fillable.pdf'
     print(f"Processing {pdf_path}")
