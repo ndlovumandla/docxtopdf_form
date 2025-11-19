@@ -3,6 +3,35 @@ import fitz  # PyMuPDF
 from docx import Document
 from docx2pdf import convert
 
+# Define button type constants if not present
+if not hasattr(fitz, 'PDF_BTN_TYPE_PUSHBUTTON'):
+    fitz.PDF_BTN_TYPE_PUSHBUTTON = 0
+if not hasattr(fitz, 'PDF_BTN_TYPE_SUBMIT'):
+    fitz.PDF_BTN_TYPE_SUBMIT = 1
+if not hasattr(fitz, 'PDF_BTN_TYPE_RESET'):
+    fitz.PDF_BTN_TYPE_RESET = 2
+
+def clean_placeholder_text(text):
+    """
+    Clean spaces in placeholder strings to handle Word conversion artifacts.
+    """
+    # First, fix spaced brackets
+    text = re.sub(r'\{\s*\{', '{{', text)
+    text = re.sub(r'\}\s*\}', '}}', text)
+    
+    # Then clean inside placeholders
+    def clean_inside(match):
+        inside = match.group(1)
+        # Remove all whitespace (spaces, newlines, etc.)
+        inside = re.sub(r'\s+', '', inside)
+        # Remove spaces around colons and pipes (though spaces are removed, keep for consistency)
+        inside = re.sub(r'\s*:\s*', ':', inside)
+        inside = re.sub(r'\s*\|\s*', '|', inside)
+        return '{{' + inside + '}}'
+    
+    text = re.sub(r'\{\{(.*?)\}\}', clean_inside, text)
+    return text
+
 def parse_placeholder(placeholder):
     """
     Parse the placeholder string like 'textbox:firstname|required'
@@ -145,7 +174,7 @@ def get_cell_dimensions(cell_rect):
     cell_height = cell_rect.height
     return cell_width, cell_height
 
-def add_form_field(page, rect, field_type, field_name, is_required, options_dict, field_type_str, font_name, font_size, text_color):
+def add_form_field(page, rect, field_type, field_name, is_required, options_dict, field_type_str, font_name, font_size, text_color, found_in_table=False):
     """
     Add a widget (form field) to the page at the given rect.
     """
@@ -153,13 +182,17 @@ def add_form_field(page, rect, field_type, field_name, is_required, options_dict
     widget.field_name = field_name
     widget.field_type = field_type
     
-    widget.fill_color = (1, 0, 0)  # RGB red
+    # Remove red background to make fields invisible
+    # widget.fill_color = (1, 0, 0)  # RGB red - commented out for invisible fields
     
     if is_required or field_type_str in ['requiredfieldattribute']:
         widget.field_flags |= fitz.PDF_FIELD_IS_REQUIRED
     
     # Adjust rect for specific types
     if field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+        side = min(rect.width, rect.height)
+        widget.rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + side, rect.y0 + side)
+    elif field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
         side = min(rect.width, rect.height)
         widget.rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + side, rect.y0 + side)
     else:
@@ -173,11 +206,9 @@ def add_form_field(page, rect, field_type, field_name, is_required, options_dict
     
     # Handle text field variants
     if field_type == fitz.PDF_WIDGET_TYPE_TEXT:
-        # Multiline
-        if field_type_str in ['multilinetextfield']:
+        # Multiline only for specific types
+        if field_type_str in ['multilinetextfield', 'richtextfield']:
             widget.field_flags |= fitz.PDF_TX_FIELD_IS_MULTILINE
-        else:
-            widget.field_flags |= fitz.PDF_TX_FIELD_IS_MULTILINE  # Default multiline for text fields
         
         # Rich text
         if field_type_str in ['richtextfield']:
@@ -195,7 +226,15 @@ def add_form_field(page, rect, field_type, field_name, is_required, options_dict
         if field_type_str in ['readonlyfield']:
             widget.field_flags |= fitz.PDF_FIELD_IS_READONLY
         
+        # Prevent text overflow/scrolling when field is full (only for non-table fields)
+        if not found_in_table:
+            widget.field_flags |= 0x800000  # PDF_TX_FIELD_IS_DONOTSCROLL
+        
         widget.text_margin = (0, 0, 0, 0)
+        
+        # For single-line fields, adjust height to prevent vertical centering
+        if not (widget.field_flags & fitz.PDF_TX_FIELD_IS_MULTILINE):
+            widget.rect.y1 = widget.rect.y0 + widget.text_fontsize * 1.5
         
         # Format scripts for special fields
         if field_type_str in ['datefield', 'date']:
@@ -248,16 +287,8 @@ def add_form_field(page, rect, field_type, field_name, is_required, options_dict
             widget.button_caption = options_dict['value']
     
     # For buttons, set button type
-    if field_type == fitz.PDF_WIDGET_TYPE_BUTTON:
-        if field_type_str in ['pushbutton', 'imagebutton']:
-            widget.button_type = fitz.PDF_BTN_TYPE_PUSHBUTTON
-        elif field_type_str == 'submitbutton':
-            widget.button_type = fitz.PDF_BTN_TYPE_SUBMIT
-        elif field_type_str == 'resetbutton':
-            widget.button_type = fitz.PDF_BTN_TYPE_RESET
-        # For submit/reset, might need to set submit_url or reset action, but PyMuPDF may not support directly
-        if 'url' in options_dict and field_type_str == 'submitbutton':
-            widget.submit_url = options_dict['url']
+    if 'url' in options_dict and field_type_str == 'submitbutton':
+        widget.submit_url = options_dict['url']
     
     # Tooltip
     if field_type_str == 'tooltipfieldattribute' and 'tooltip' in options_dict:
@@ -285,22 +316,12 @@ def add_form_field(page, rect, field_type, field_name, is_required, options_dict
     
     page.add_widget(widget)
 
-def convert_docx_to_fillable_pdf(docx_path, output_pdf_path):
+def convert_docx_to_fillable_pdf(pdf_path, output_pdf_path):
     """
-    Converts a .docx file to a fillable PDF by detecting placeholders like {{textbox:firstname|required}}
-    and replacing them with PDF form fields that match the table cell dimensions.
+    Processes a PDF file by detecting placeholders like {{textbox:firstname}}
+    and replacing them with PDF form fields that automatically size to table cell dimensions.
     """
-    import os
-    folder = os.path.dirname(docx_path)
-    temp_pdf = os.path.join(folder, "temp.pdf")
-    
-    try:
-        convert(docx_path, temp_pdf)
-    except Exception as e:
-        if not os.path.exists(temp_pdf):
-            raise e
-    
-    doc = fitz.open(temp_pdf)
+    doc = fitz.open(pdf_path)
     
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -309,8 +330,17 @@ def convert_docx_to_fillable_pdf(docx_path, output_pdf_path):
         # Detect tables on the page
         tables = list(page.find_tables(strategy="lines"))
         
-        # Find all unique placeholders
-        placeholders = re.findall(r'\{\{(.*?)\}\}', full_text)
+        # Find all unique placeholders by searching for {{
+        placeholders = set()
+        for inst in page.search_for('{{'):
+            # Get text in a rect around the {{
+            text_rect = fitz.Rect(inst.x0, inst.y0, inst.x0 + 300, inst.y0 + 50)  # Adjust size as needed
+            text = page.get_textbox(text_rect)
+            text = clean_placeholder_text(text)
+            matches = re.findall(r'\{\{(.*?)\}\}', text, re.DOTALL)
+            placeholders.update(matches)
+        
+        placeholders = list(placeholders)
         print(f"Page {page_num}: Found placeholders: {placeholders}")
         
         for ph in set(placeholders):
@@ -365,7 +395,7 @@ def convert_docx_to_fillable_pdf(docx_path, output_pdf_path):
                 
                 # Add the form field using the cell dimensions
                 add_form_field(page, cell_rect, field_type, field_name, is_required, 
-                             options_dict, field_type_str, font_name, font_size, text_color)
+                             options_dict, field_type_str, font_name, font_size, text_color, found_in_table)
                 
                 # Remove the placeholder text
                 redact_annot = page.add_redact_annot(inst_rect)
@@ -374,13 +404,36 @@ def convert_docx_to_fillable_pdf(docx_path, output_pdf_path):
     # Save the modified PDF
     doc.save(output_pdf_path, garbage=4, deflate=True)
     doc.close()
-    
-    # Remove temp file
-    os.remove(temp_pdf)
 
 if __name__ == "__main__":
+    import sys
     import os
-    docx_path = "D:\\POE Templates\\PoE - BA4 - SP3 - Ver.07.25.1 F.docx"
-    folder = os.path.dirname(docx_path)
-    output_pdf_path = os.path.join(folder, "output.pdf")
-    convert_docx_to_fillable_pdf(docx_path, output_pdf_path)
+    if len(sys.argv) != 2:
+        print("Usage: python pdfconv.py <docx_or_pdf_file>")
+        sys.exit(1)
+    input_path = sys.argv[1]
+    if not os.path.exists(input_path):
+        print(f"Error: File not found at {input_path}")
+        sys.exit(1)
+    
+    if input_path.lower().endswith('.docx'):
+        # Convert DOCX to PDF
+        pdf_path = os.path.splitext(input_path)[0] + '.pdf'
+        print(f"Converting {input_path} to {pdf_path}")
+        try:
+            convert(input_path, pdf_path)
+        except Exception as e:
+            print(f"Conversion failed: {e}")
+            if not os.path.exists(pdf_path):
+                print("PDF was not created. Exiting.")
+                sys.exit(1)
+            else:
+                print("PDF exists, proceeding with processing.")
+    else:
+        pdf_path = input_path
+    
+    # Process the PDF
+    output_pdf_path = os.path.splitext(pdf_path)[0] + '_fillable.pdf'
+    print(f"Processing {pdf_path}")
+    convert_docx_to_fillable_pdf(pdf_path, output_pdf_path)
+    print(f"Output saved to: {output_pdf_path}")
